@@ -21,15 +21,16 @@ from __future__ import annotations
 
 import logging
 import zlib
+import hashlib
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
 import sqlalchemy_jsonfield
 import uuid6
-from sqlalchemy import ForeignKey, LargeBinary, String, select, tuple_
+from sqlalchemy import Column, ForeignKey, LargeBinary, String, select, tuple_
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, backref, foreign, relationship
+from sqlalchemy.orm import backref, foreign, relationship
 from sqlalchemy.sql.expression import func, literal
 from sqlalchemy_utils import UUIDType
 
@@ -49,7 +50,7 @@ from airflow.serialization.serialized_objects import LazyDeserializedDAG, Serial
 from airflow.settings import COMPRESS_SERIALIZED_DAGS, json
 from airflow.utils.hashlib_wrapper import md5
 from airflow.utils.session import NEW_SESSION, provide_session
-from airflow.utils.sqlalchemy import UtcDateTime, mapped_column
+from airflow.utils.sqlalchemy import UtcDateTime
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -280,17 +281,15 @@ class SerializedDagModel(Base):
     """
 
     __tablename__ = "serialized_dag"
-    id: Mapped[str] = mapped_column(UUIDType(binary=False), primary_key=True, default=uuid6.uuid7)
-    dag_id: Mapped[str] = mapped_column(String(ID_LEN), nullable=False)
-    _data: Mapped[dict | None] = mapped_column(
+    id = Column(UUIDType(binary=False), primary_key=True, default=uuid6.uuid7)
+    dag_id = Column(String(ID_LEN), nullable=False)
+    _data = Column(
         "data", sqlalchemy_jsonfield.JSONField(json=json).with_variant(JSONB, "postgresql"), nullable=True
     )
-    _data_compressed: Mapped[bytes | None] = mapped_column("data_compressed", LargeBinary, nullable=True)
-    created_at: Mapped[UtcDateTime] = mapped_column(UtcDateTime, nullable=False, default=timezone.utcnow)
-    last_updated: Mapped[UtcDateTime] = mapped_column(
-        UtcDateTime, nullable=False, default=timezone.utcnow, onupdate=timezone.utcnow
-    )
-    dag_hash: Mapped[str] = mapped_column(String(32), nullable=False)
+    _data_compressed = Column("data_compressed", LargeBinary, nullable=True)
+    created_at = Column(UtcDateTime, nullable=False, default=timezone.utcnow)
+    last_updated = Column(UtcDateTime, nullable=False, default=timezone.utcnow, onupdate=timezone.utcnow)
+    dag_hash = Column(String(32), nullable=False)
 
     dag_runs = relationship(
         DagRun,
@@ -306,7 +305,7 @@ class SerializedDagModel(Base):
         innerjoin=True,
         backref=backref("serialized_dag", uselist=False, innerjoin=True),
     )
-    dag_version_id: Mapped[str] = mapped_column(
+    dag_version_id = Column(
         UUIDType(binary=False),
         ForeignKey("dag_version.id", ondelete="CASCADE"),
         nullable=False,
@@ -320,19 +319,16 @@ class SerializedDagModel(Base):
         self.dag_id = dag.dag_id
         dag_data = dag.data
         self.dag_hash = SerializedDagModel.hash(dag_data)
-
-        # partially ordered json data
-        dag_data_json = json.dumps(dag_data, sort_keys=True).encode("utf-8")
+        sorted_dag_data = SerializedDagModel._sort_serialized_dag_dict(dag_data)
+        sorted_dag_data_json = json.dumps(sorted_dag_data, sort_keys=True).encode("utf-8")
 
         if COMPRESS_SERIALIZED_DAGS:
             self._data = None
-            self._data_compressed = zlib.compress(dag_data_json)
+            self._data_compressed = zlib.compress(sorted_dag_data_json)
         else:
             self._data = dag_data
             self._data_compressed = None
 
-        # serve as cache so no need to decompress and load, when accessing data field
-        # when COMPRESS_SERIALIZED_DAGS is True
         self.__data_cache = dag_data
 
     def __repr__(self) -> str:
@@ -353,7 +349,7 @@ class SerializedDagModel(Base):
 
     @classmethod
     def _sort_serialized_dag_dict(cls, serialized_dag: Any):
-        """Recursively sort json_dict and its nested dictionaries and lists."""
+        """Ensures deterministic ordering for hashing and DB persistence."""
         if isinstance(serialized_dag, dict):
             return {k: cls._sort_serialized_dag_dict(v) for k, v in sorted(serialized_dag.items())}
         if isinstance(serialized_dag, list):
@@ -411,6 +407,7 @@ class SerializedDagModel(Base):
 
         log.debug("Checking if DAG (%s) changed", dag.dag_id)
         new_serialized_dag = cls(dag)
+    
         serialized_dag_hash = session.scalars(
             select(cls.dag_hash).where(cls.dag_id == dag.dag_id).order_by(cls.created_at.desc())
         ).first()
